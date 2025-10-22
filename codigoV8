@@ -16,7 +16,6 @@ const unsigned long TRACK_INTERVAL_MS = 50;
 const unsigned long SERVO_TILT_SETTLE_MS = 300;
 const unsigned long TRACK_SERVO_SETTLE_MS = 15;
 
-// --- LÓGICA DE DETECÇÃO REFINADA ---
 const int DETECTION_MIN_CM = 30;    // NOVO: <30cm é ignorado
 const int DETECTION_MAX_CM = 800;   // NOVO: max 8m
 unsigned long targetLostTimeout = 2000;
@@ -142,7 +141,7 @@ void runSearchMode() {
 
     int dist = readLidarCm();
     if (dist > DETECTION_MIN_CM && dist < DETECTION_MAX_CM) { 
-      Serial.print("ALERTA! Alvo detectado em (P,T): ("); Serial.print(searchState.panAngle); Serial.print(","); Serial.print(TILT_SEARCH_LEVELS[searchState.tiltIndex]);
+      Serial.print("OBJETO em (P,T): ("); Serial.print(searchState.panAngle); Serial.print(","); Serial.print(TILT_SEARCH_LEVELS[searchState.tiltIndex]);
       Serial.print(") a "); Serial.print(dist); Serial.println("cm.");
       
       acquireState.initialPan = searchState.panAngle;
