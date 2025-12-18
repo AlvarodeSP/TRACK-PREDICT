@@ -1,0 +1,460 @@
+#include <Servo.h>
+#include <Wire.h>
+#include <TFLI2C.h>
+#include <NewPing.h>
+
+const int PIN_SERVO_PAN = 4;
+const int PIN_SERVO_TILT = 5;
+const int PIN_HCSR04_TRIG = 6;
+const int PIN_HCSR04_ECHO = 7;
+
+const int PAN_OFFSET = 5;
+const int TILT_OFFSET = -2;
+
+const unsigned long SEARCH_INTERVAL_MS = 25;
+const unsigned long ACQUIRE_INTERVAL_MS = 20;
+const unsigned long TRACK_SERVO_SETTLE_MS = 15;
+
+const int DETECTION_MIN_CM = 30;
+const int DETECTION_MAX_CM = 800;
+const int ULTRASONIC_MAX_CM = 400;
+const int DETECTION_THRESHOLD_CM = 50;
+unsigned long targetLostTimeout = 2000;
+
+const int SEARCH_STEP = 5;
+const int ACQUIRE_RADIUS = 8;
+const int ACQUIRE_STEP = 2;
+const int TRACK_RADIUS = 4;
+const int TRACK_STEP = 2;
+
+const int DEADBAND = 3;
+const int TRACK_STEP_FAST = 4;
+const float PREDICTION_GAIN = 1.3;
+
+const int TILT_SEARCH_LEVELS[] = {20, 45, 70};
+const int NUM_TILT_LEVELS = sizeof(TILT_SEARCH_LEVELS) / sizeof(TILT_SEARCH_LEVELS[0]);
+
+Servo panServo;
+Servo tiltServo;
+TFLI2C tflI2C;
+NewPing sonar(PIN_HCSR04_TRIG, PIN_HCSR04_ECHO, ULTRASONIC_MAX_CM);
+int16_t tfAddr = 0x10;
+
+enum SystemState { CALIBRATING, SEARCHING, ACQUIRING, TRACKING };
+SystemState currentState = CALIBRATING;
+
+int backgroundMap[NUM_TILT_LEVELS][(180 / SEARCH_STEP) + 1];
+
+struct TargetInfo {
+  int pan = 90;
+  int tilt = 45;
+  int prevPan = 90;
+  int prevTilt = 45;
+  unsigned long lastSeenTimestamp = 0;
+  unsigned long prevTrackTimestamp = 0;
+};
+TargetInfo target;
+
+float panSpeed = 0.0;
+float tiltSpeed = 0.0;
+
+struct ScanState {
+  int panAngle = 0;
+  int tiltIndex = 0;
+  int panDirection = SEARCH_STEP;
+  bool isTilting = true;
+};
+ScanState scanState;
+
+struct AcquireState {
+  enum SubState { IDLE, CONFIRM_ULTRASONIC, SCANNING_LIDAR, FAILED, SUCCEEDED };
+  SubState subState = IDLE;
+  int initialPan;
+  int initialTilt;
+  int tiltIndexForMap;
+  int currentPan;
+  int currentTilt;
+  int bestPan;
+  int bestTilt;
+  int bestDifference;
+};
+AcquireState acquireState;
+
+struct TrackState {
+  enum SubState { START_SCAN, SCANNING, CALCULATE_PREDICTION };
+  SubState subState = START_SCAN;
+  int currentPan;
+  int currentTilt;
+  int bestPan;
+  int bestTilt;
+  int bestDifference;
+  int predictedPan;
+  int predictedTilt;
+};
+TrackState trackState;
+
+unsigned long lastActionTimestamp = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  Serial.println("INICIO - DETECCAO");
+
+  panServo.attach(PIN_SERVO_PAN);
+  tiltServo.attach(PIN_SERVO_TILT);
+
+  Serial.println("CALIBRACAO");
+  for (int i = 0; i < NUM_TILT_LEVELS; i++) {
+    for (int j = 0; j < (180 / SEARCH_STEP) + 1; j++) {
+      backgroundMap[i][j] = DETECTION_MAX_CM;
+    }
+  }
+
+  tiltServo.write(TILT_SEARCH_LEVELS[scanState.tiltIndex] + TILT_OFFSET);
+  panServo.write(scanState.panAngle + PAN_OFFSET);
+  
+  lastActionTimestamp = millis();
+  currentState = CALIBRATING;
+}
+
+void loop() {
+  switch (currentState) {
+    case CALIBRATING:
+      runCalibrationMode();
+      break;
+    case SEARCHING:
+      runSearchMode();
+      break;
+    case ACQUIRING:
+      runAcquisitionMode();
+      break;
+    case TRACKING:
+      runTrackingMode();
+      break;
+  }
+}
+
+int readLidarCm() {
+  int16_t tfDist;
+  if (tflI2C.getData(tfDist, tfAddr)) {
+    return tfDist;
+  }
+  return -1;
+}
+
+void runCalibrationMode() {
+  if (scanState.isTilting) {
+    if (millis() - lastActionTimestamp >= TRACK_SERVO_SETTLE_MS) {
+      scanState.isTilting = false;
+      lastActionTimestamp = millis();
+    }
+    return;
+  }
+
+  if (millis() - lastActionTimestamp >= SEARCH_INTERVAL_MS) {
+    lastActionTimestamp = millis();
+
+    int dist = readLidarCm();
+    int pan_idx = scanState.panAngle / SEARCH_STEP;
+    
+    if (dist > 0) {
+      backgroundMap[scanState.tiltIndex][pan_idx] = dist;
+    } else {
+      backgroundMap[scanState.tiltIndex][pan_idx] = DETECTION_MAX_CM;
+    }
+
+    scanState.panAngle += scanState.panDirection;
+    panServo.write(scanState.panAngle + PAN_OFFSET);
+
+    if (scanState.panAngle >= 180 || scanState.panAngle <= 0) {
+      scanState.tiltIndex++;
+
+      if (scanState.tiltIndex >= NUM_TILT_LEVELS) {
+        Serial.println("CALIBRACAO FIM");
+        Serial.println("BUSCA");
+        currentState = SEARCHING;
+        scanState.panAngle = 0;
+        scanState.tiltIndex = 0;
+        scanState.panDirection = SEARCH_STEP;
+        scanState.isTilting = true;
+        lastActionTimestamp = millis();
+        return;
+      }
+
+      tiltServo.write(TILT_SEARCH_LEVELS[scanState.tiltIndex] + TILT_OFFSET);
+      scanState.panDirection *= -1;
+      scanState.panAngle = constrain(scanState.panAngle, 0, 180);
+      scanState.isTilting = true;
+    }
+  }
+}
+
+void runSearchMode() {
+  if (scanState.isTilting) {
+    if (millis() - lastActionTimestamp >= TRACK_SERVO_SETTLE_MS) {
+      scanState.isTilting = false;
+      lastActionTimestamp = millis();
+    }
+    return;
+  }
+
+  if (millis() - lastActionTimestamp >= SEARCH_INTERVAL_MS) {
+    lastActionTimestamp = millis();
+
+    int dist_atual = readLidarCm();
+    if (dist_atual <= DETECTION_MIN_CM) return;
+
+    int pan_idx = scanState.panAngle / SEARCH_STEP;
+    int dist_fundo = backgroundMap[scanState.tiltIndex][pan_idx];
+    int diferenca = dist_fundo - dist_atual;
+
+    if (diferenca > DETECTION_THRESHOLD_CM) {
+      Serial.print("OBJETO - (P,T): ("); Serial.print(scanState.panAngle); Serial.print(","); Serial.print(TILT_SEARCH_LEVELS[scanState.tiltIndex]);
+      Serial.print(") a "); Serial.print(dist_atual); Serial.print("cm (Fundo: "); Serial.print(dist_fundo); Serial.println("cm)");
+
+      acquireState.initialPan = scanState.panAngle;
+      acquireState.initialTilt = TILT_SEARCH_LEVELS[scanState.tiltIndex];
+      acquireState.tiltIndexForMap = scanState.tiltIndex;
+      acquireState.subState = AcquireState::IDLE;
+      currentState = ACQUIRING;
+      Serial.println("ACQUISICAO");
+      return;
+    }
+
+    scanState.panAngle += scanState.panDirection;
+    panServo.write(scanState.panAngle + PAN_OFFSET);
+
+    if (scanState.panAngle >= 180 || scanState.panAngle <= 0) {
+      scanState.tiltIndex = (scanState.tiltIndex + 1) % NUM_TILT_LEVELS;
+      tiltServo.write(TILT_SEARCH_LEVELS[scanState.tiltIndex] + TILT_OFFSET);
+      
+      scanState.panDirection *= -1;
+      scanState.panAngle = constrain(scanState.panAngle, 0, 180);
+      scanState.isTilting = true;
+    }
+  }
+}
+
+void runAcquisitionMode() {
+  switch (acquireState.subState) {
+    case AcquireState::IDLE:
+      panServo.write(acquireState.initialPan + PAN_OFFSET);
+      tiltServo.write(acquireState.initialTilt + TILT_OFFSET);
+      Serial.print("SHEPARD - HCSR04");
+      acquireState.subState = AcquireState::CONFIRM_ULTRASONIC;
+      break;
+
+    case AcquireState::CONFIRM_ULTRASONIC:
+      {
+        long ultrasonicDist = sonar.ping_cm();
+        
+        if (ultrasonicDist > DETECTION_MIN_CM && ultrasonicDist > 0) { 
+            Serial.print(" POSITIVO. Dist: "); Serial.println(ultrasonicDist);
+            Serial.println("LIDAR - BIGGEST DIFF");
+            
+            acquireState.currentPan = acquireState.initialPan - ACQUIRE_RADIUS;
+            acquireState.currentTilt = acquireState.initialTilt - ACQUIRE_RADIUS;
+            acquireState.bestPan = acquireState.initialPan;
+            acquireState.bestTilt = acquireState.initialTilt;
+            acquireState.bestDifference = 0;
+            acquireState.subState = AcquireState::SCANNING_LIDAR;
+            lastActionTimestamp = millis();
+        } else {
+            Serial.println(" NEGATIVO - BUSCA");
+            acquireState.subState = AcquireState::FAILED;
+        }
+      }
+      break;
+
+    case AcquireState::SCANNING_LIDAR:
+      if (millis() - lastActionTimestamp >= ACQUIRE_INTERVAL_MS) {
+        lastActionTimestamp = millis();
+        
+        panServo.write(acquireState.currentPan + PAN_OFFSET);
+        tiltServo.write(acquireState.currentTilt + TILT_OFFSET);
+
+        delay(TRACK_SERVO_SETTLE_MS);
+
+        int dist = readLidarCm();
+        
+        if (dist > DETECTION_MIN_CM) {
+            int pan_idx = constrain(acquireState.currentPan, 0, 180) / SEARCH_STEP;
+            int dist_fundo = backgroundMap[acquireState.tiltIndexForMap][pan_idx];
+            int diferenca = dist_fundo - dist;
+
+            if (diferenca > acquireState.bestDifference) { 
+              acquireState.bestDifference = diferenca;
+              acquireState.bestPan = acquireState.currentPan;
+              acquireState.bestTilt = acquireState.currentTilt;
+            }
+        }
+
+        acquireState.currentPan += ACQUIRE_STEP;
+        if (acquireState.currentPan > acquireState.initialPan + ACQUIRE_RADIUS) {
+          acquireState.currentPan = acquireState.initialPan - ACQUIRE_RADIUS;
+          acquireState.currentTilt += ACQUIRE_STEP;
+          if (acquireState.currentTilt > acquireState.initialTilt + ACQUIRE_RADIUS) {
+            
+            if (acquireState.bestDifference > DETECTION_THRESHOLD_CM) {
+                acquireState.subState = AcquireState::SUCCEEDED;
+            } else {
+                Serial.println("VARREDURA FALHA - BUSCA");
+                acquireState.subState = AcquireState::FAILED;
+            }
+          }
+        }
+      }
+      break;
+
+    case AcquireState::SUCCEEDED:
+      Serial.print("LOCK - Centro do alvo: (P,T): ("); Serial.print(acquireState.bestPan); Serial.print(","); Serial.print(acquireState.bestTilt);
+      Serial.print(") DIFF "); Serial.print(acquireState.bestDifference); Serial.println("cm do fundo.");
+      
+      target.pan = acquireState.bestPan;
+      target.tilt = acquireState.bestTilt;
+      target.prevPan = acquireState.bestPan;
+      target.prevTilt = acquireState.bestTilt;
+      target.lastSeenTimestamp = millis();
+      target.prevTrackTimestamp = millis();
+      
+      panSpeed = 0.0;
+      tiltSpeed = 0.0;
+      
+      currentState = TRACKING;
+      trackState.subState = TrackState::START_SCAN;
+      Serial.println("TRACKING");
+      break;
+
+    case AcquireState::FAILED:
+      scanState.isTilting = true;
+      lastActionTimestamp = millis();
+      currentState = SEARCHING;
+      break;
+  }
+}
+
+void runTrackingMode() {
+  if (millis() - target.lastSeenTimestamp > targetLostTimeout) {
+    Serial.println("TIMEOUT - VOLTANDO PARA BUSCA");
+    currentState = SEARCHING;
+    scanState.isTilting = true;
+    return;
+  }
+
+  if ((target.pan <= 2 || target.pan >= 178) && (millis() - target.lastSeenTimestamp > 1000)) {
+     Serial.println("ALVO PRESO NA BORDA - FORCANDO RE-BUSCA");
+     panSpeed = 0; 
+     currentState = SEARCHING; 
+     scanState.panAngle = 90; 
+     scanState.isTilting = true;
+     return;
+  }
+
+  switch (trackState.subState) {
+    case TrackState::START_SCAN:
+    {
+      unsigned long currentTime = millis();
+      float deltaTime = (currentTime - target.prevTrackTimestamp) / 1000.0f;
+      if (deltaTime < 0.01) deltaTime = 0.01;
+
+      trackState.predictedPan = target.pan + (panSpeed * deltaTime * PREDICTION_GAIN);
+      trackState.predictedTilt = target.tilt + (tiltSpeed * deltaTime * PREDICTION_GAIN);
+
+      trackState.predictedPan = constrain(trackState.predictedPan, TRACK_RADIUS, 180 - TRACK_RADIUS);
+      trackState.predictedTilt = constrain(trackState.predictedTilt, TRACK_RADIUS, 180 - TRACK_RADIUS);
+
+      trackState.currentPan = trackState.predictedPan - TRACK_RADIUS;
+      trackState.currentTilt = trackState.predictedTilt - TRACK_RADIUS;
+      
+      trackState.bestPan = trackState.predictedPan; 
+      trackState.bestTilt = trackState.predictedTilt;
+      trackState.bestDifference = 0; 
+
+      trackState.subState = TrackState::SCANNING;
+      lastActionTimestamp = millis();
+      break;
+    }
+
+    case TrackState::SCANNING:
+      if (millis() - lastActionTimestamp >= ACQUIRE_INTERVAL_MS) {
+        lastActionTimestamp = millis();
+
+        panServo.write(trackState.currentPan + PAN_OFFSET);
+        tiltServo.write(trackState.currentTilt + TILT_OFFSET);
+        
+        delay(TRACK_SERVO_SETTLE_MS); 
+
+        int dist = readLidarCm();
+        
+        int pan_idx = constrain(trackState.currentPan, 0, 180) / SEARCH_STEP;
+        int tilt_idx = 0;
+        int min_diff = 1000;
+        
+        for(int i=0; i<NUM_TILT_LEVELS; i++) {
+            if(abs(trackState.currentTilt - TILT_SEARCH_LEVELS[i]) < min_diff) {
+                min_diff = abs(trackState.currentTilt - TILT_SEARCH_LEVELS[i]);
+                tilt_idx = i;
+            }
+        }
+        
+        int dist_fundo = backgroundMap[tilt_idx][pan_idx];
+
+        if (dist > 0 && dist_fundo < DETECTION_MAX_CM) {
+            int diferenca = dist_fundo - dist;
+            
+            if (diferenca > DETECTION_THRESHOLD_CM && diferenca > trackState.bestDifference) {
+              trackState.bestDifference = diferenca;
+              trackState.bestPan = trackState.currentPan;
+              trackState.bestTilt = trackState.currentTilt;
+            }
+        }
+
+        trackState.currentPan += TRACK_STEP_FAST; 
+        
+        if (trackState.currentPan > trackState.predictedPan + TRACK_RADIUS) {
+          trackState.currentPan = trackState.predictedPan - TRACK_RADIUS;
+          trackState.currentTilt += TRACK_STEP_FAST;
+          
+          if (trackState.currentTilt > trackState.predictedTilt + TRACK_RADIUS) {
+            trackState.subState = TrackState::CALCULATE_PREDICTION;
+          }
+        }
+      }
+      break;
+
+    case TrackState::CALCULATE_PREDICTION:
+      if (trackState.bestDifference > DETECTION_THRESHOLD_CM) {
+        
+        if (abs(trackState.bestPan - target.pan) < DEADBAND && 
+            abs(trackState.bestTilt - target.tilt) < DEADBAND) {
+            
+            panSpeed = 0;
+            tiltSpeed = 0;
+            trackState.bestDifference = 0;
+            trackState.subState = TrackState::START_SCAN;
+            return; 
+        }
+
+        unsigned long currentTime = millis();
+        float deltaTime = (currentTime - target.prevTrackTimestamp) / 1000.0f;
+        if (deltaTime < 0.01) deltaTime = 0.01;
+
+        panSpeed = (trackState.bestPan - target.pan) / deltaTime;
+        tiltSpeed = (trackState.bestTilt - target.tilt) / deltaTime;
+        
+        target.pan = trackState.bestPan;
+        target.tilt = trackState.bestTilt;
+        target.lastSeenTimestamp = currentTime;
+        target.prevTrackTimestamp = currentTime;
+
+        Serial.print("TRACK: ("); Serial.print(target.pan); Serial.print(","); Serial.print(target.tilt); Serial.println(")");
+
+      } else {
+        Serial.println("TRACK - SAD");
+      }
+
+      trackState.bestDifference = 0;
+      trackState.subState = TrackState::START_SCAN;
+      break;
+  }
+}
